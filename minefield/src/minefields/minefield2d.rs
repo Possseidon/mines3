@@ -6,12 +6,12 @@ use itertools::iproduct;
 use crate::minefield::{AdjacentFields, MinefieldReader, MinefieldWriter};
 
 #[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Vec2 {
+pub struct UVec2 {
     pub x: usize,
     pub y: usize,
 }
 
-impl Vec2 {
+impl UVec2 {
     pub fn new(x: usize, y: usize) -> Self {
         Self { x, y }
     }
@@ -24,43 +24,43 @@ pub struct Minefield2D {
 }
 
 impl Minefield2D {
-    pub fn new(size: Vec2) -> Self {
+    pub fn new(size: UVec2) -> Self {
         Self {
             mines: BitVec::repeat(false, size.x * size.y),
             width: size.x,
         }
     }
 
-    pub fn size(&self) -> Vec2 {
-        Vec2 {
+    pub fn size(&self) -> UVec2 {
+        UVec2 {
             x: self.width,
             y: self.mines.len() / self.width,
         }
     }
 
-    pub fn is_mine(&self, coord: Vec2) -> Option<bool> {
+    pub fn is_mine(&self, coord: UVec2) -> Option<bool> {
         self.coord_to_field_index(coord)
             .map(|field_index| self.mines[field_index])
     }
 
-    pub fn set_mine(&mut self, coord: Vec2, mine: bool) {
+    pub fn set_mine(&mut self, coord: UVec2, mine: bool) {
         let field_index = self
             .coord_to_field_index(coord)
             .expect("coord out of range");
         self.mines.set(field_index, mine);
     }
 
-    pub fn place_mine(&mut self, coord: Vec2) {
+    pub fn place_mine(&mut self, coord: UVec2) {
         self.set_mine(coord, true);
     }
 
-    pub fn coord_to_field_index(&self, coord: Vec2) -> Option<usize> {
+    pub fn coord_to_field_index(&self, coord: UVec2) -> Option<usize> {
         let field_index = (coord.x < self.width).then_some(coord.x + coord.y * self.width)?;
         (field_index < self.field_count()).then_some(field_index)
     }
 
-    pub fn field_index_to_coord(&self, field_index: usize) -> Option<Vec2> {
-        (field_index < self.field_count()).then_some(Vec2 {
+    pub fn field_index_to_coord(&self, field_index: usize) -> Option<UVec2> {
+        (field_index < self.field_count()).then_some(UVec2 {
             x: field_index % self.width,
             y: field_index / self.width,
         })
@@ -82,8 +82,8 @@ impl AdjacentFields for Minefield2D {
             coord.y.saturating_sub(1)..=coord.y.saturating_add(1)
         )
         .filter_map(move |(x, y)| {
-            if Vec2::new(x, y) != coord {
-                self.coord_to_field_index(Vec2 { x, y })
+            if UVec2::new(x, y) != coord {
+                self.coord_to_field_index(UVec2 { x, y })
             } else {
                 None
             }
