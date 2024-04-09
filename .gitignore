@@ -7,3 +7,5 @@
 !/.pre-commit-config.yaml
 
 /target/
+
+/Cargo.lock
