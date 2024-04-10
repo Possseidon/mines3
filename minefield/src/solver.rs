@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, num::NonZeroU8};
 
 use bitvec::vec::BitVec;
 use itertools::Itertools;
@@ -6,8 +6,59 @@ use thiserror::Error;
 
 use crate::minefield::MinefieldReader;
 
-/// The default maximum complexity used by the [`MinefieldSolver`].
-pub(crate) const DEFAULT_MAX_COMPLEXITY: usize = 10;
+/// Insights to which heuristic was used by the solver.
+pub enum SolveStepInfo {
+    /// All remaining fields could be flagged.
+    FlaggedRest,
+    /// All remaining fields could be revealed.
+    RevealedRest,
+    /// Trivial solve actions were applied.
+    Trivial,
+    /// Complex solve actions with the given complexity were applied.
+    Complex(Complexity),
+}
+
+impl SolveStepInfo {
+    pub fn complexity(self) -> Option<Complexity> {
+        match self {
+            SolveStepInfo::FlaggedRest | SolveStepInfo::RevealedRest | SolveStepInfo::Trivial => {
+                None
+            }
+            SolveStepInfo::Complex(complexity) => Some(complexity),
+        }
+    }
+}
+
+/// The complexity required to solve a minefield.
+///
+/// Represented as the maximum number of fields that have to be looked at in parallel to find the
+/// next fields to reveal or flag.
+///
+/// Higher complexities will not only be harder to solve for humans but also take quite long to
+/// compute. Given a complexity `N`, the runtime is `O(2^N)`, since it makes use of a power set to
+/// check all the possible mine configurations.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Complexity(NonZeroU8);
+
+impl Complexity {
+    pub const MIN: Self = Self(if let Some(min) = NonZeroU8::new(2) {
+        min
+    } else {
+        unreachable!()
+    });
+    pub const MAX: Self = Self(NonZeroU8::MAX);
+
+    const fn new(complexity: u8) -> Option<Self> {
+        if Self::MIN.0.get() <= complexity && complexity <= Self::MAX.0.get() {
+            let Some(complexity) = NonZeroU8::new(complexity) else {
+                unreachable!()
+            };
+            Some(Self(complexity))
+        } else {
+            None
+        }
+    }
+}
 
 /// Solves generic minesweeper games readable through the [`MinefieldReader`] trait.
 ///
@@ -16,8 +67,6 @@ pub(crate) const DEFAULT_MAX_COMPLEXITY: usize = 10;
 pub struct MinefieldSolver<'a, T: MinefieldReader> {
     /// The reader to get information about which fields are connected and which are mines.
     minefield: &'a T,
-    /// The maximum complexity before solving returns [`SolveError::TooComplex`].
-    max_complexity: Option<usize>,
     /// Caches the number of adjacent mines for each field.
     ///
     /// Only set for fields that do not contain a mine themselves.
@@ -36,13 +85,8 @@ pub struct MinefieldSolver<'a, T: MinefieldReader> {
 }
 
 impl<'a, T: MinefieldReader> MinefieldSolver<'a, T> {
-    /// Creates a new [`MinefieldSolver`] for the given board with the [`DEFAULT_MAX_COMPLEXITY`].
-    pub fn new(minefield: &'a T) -> Self {
-        Self::with_max_complexity(minefield, Some(DEFAULT_MAX_COMPLEXITY))
-    }
-
     /// Creates a new [`MinefieldSolver`] for the given board and maximum complexity.
-    pub fn with_max_complexity(minefield: &'a T, max_complexity: Option<usize>) -> Self {
+    pub fn new(minefield: &'a T) -> Self {
         let field_count = minefield.field_count();
         let mines = minefield.mine_count();
         let adjacent_mines = (0..field_count)
@@ -56,7 +100,6 @@ impl<'a, T: MinefieldReader> MinefieldSolver<'a, T> {
             .collect();
         Self {
             minefield,
-            max_complexity,
             adjacent_mines,
             processed: BitVec::repeat(false, field_count),
             adjacent_unrevealed: Default::default(),
@@ -111,12 +154,16 @@ impl<'a, T: MinefieldReader> MinefieldSolver<'a, T> {
         Ok(())
     }
 
-    /// Attempts to solve the board, returning an error if solving is too complex or impossible.
-    pub fn solve(&mut self) -> Result<(), SolveError> {
+    /// Attempts to solve the board, returning the required complexity to solve.
+    pub fn solve(
+        &mut self,
+        max_complexity: Option<Complexity>,
+    ) -> Result<Option<Complexity>, SolveError> {
+        let mut complexity = None;
         while !self.fully_flagged_and_revealed() {
-            self.solve_step()?;
+            complexity = complexity.max(self.solve_step(max_complexity)?.complexity());
         }
-        Ok(())
+        Ok(complexity)
     }
 
     /// Returns `true` if all fields got either flagged or revealed.
@@ -130,8 +177,11 @@ impl<'a, T: MinefieldReader> MinefieldSolver<'a, T> {
     ///
     /// Panics if invalid fields are revealed. This should not happen as long as [`MinefieldReader`]
     /// is implemented properly.
-    pub fn solve_step(&mut self) -> Result<(), SolveError> {
-        let solve_actions = self.next_solve_actions()?;
+    pub fn solve_step(
+        &mut self,
+        max_complexity: Option<Complexity>,
+    ) -> Result<SolveStepInfo, SolveError> {
+        let (solve_actions, info) = self.next_solve_actions(max_complexity)?;
 
         self.reveal_many(solve_actions.reveal).unwrap();
 
@@ -139,7 +189,7 @@ impl<'a, T: MinefieldReader> MinefieldSolver<'a, T> {
             self.flag(field_index).unwrap();
         }
 
-        Ok(())
+        Ok(info)
     }
 
     /// Uses a bunch of heuristics to find the next [`SolveActions`], i.e. reveals/flags to perform.
@@ -153,13 +203,16 @@ impl<'a, T: MinefieldReader> MinefieldSolver<'a, T> {
     ///
     /// Since the last step can quickly get out of hand in terms of complexity, it will only try to
     /// solve groups of up to [`Self::max_complexity`] fields.
-    pub fn next_solve_actions(&self) -> Result<SolveActions, SolveError> {
+    pub fn next_solve_actions(
+        &self,
+        max_complexity: Option<Complexity>,
+    ) -> Result<(SolveActions, SolveStepInfo), SolveError> {
         if let Some(actions) = self.flag_rest_if_no_reveals_left() {
-            return Ok(actions);
+            return Ok((actions, SolveStepInfo::FlaggedRest));
         }
 
         if let Some(actions) = self.reveal_rest_if_no_mines_left() {
-            return Ok(actions);
+            return Ok((actions, SolveStepInfo::RevealedRest));
         }
 
         let adjacent_revealed_per_unrevealed = self
@@ -183,7 +236,10 @@ impl<'a, T: MinefieldReader> MinefieldSolver<'a, T> {
             .copied()
             .collect();
 
-        let mut actions = self.trivial_solve_actions(&adjacent_revealed);
+        let actions = self.trivial_solve_actions(&adjacent_revealed);
+        if !actions.is_empty() {
+            return Ok((actions, SolveStepInfo::Trivial));
+        }
 
         // TODO: Look at possible mine placements only for a single revealed cell's neighbors.
         //       Aka, still use a powerset, but only around a single field.
@@ -191,38 +247,56 @@ impl<'a, T: MinefieldReader> MinefieldSolver<'a, T> {
 
         let revealed_groups = group_overlapping(adjacent_revealed_per_unrevealed);
 
-        let groups = revealed_groups.into_iter().map(|revealed_group| {
-            let unrevealed_group = revealed_group
-                .iter()
-                .flat_map(|&field_index| {
-                    self.minefield
-                        .adjacent_fields(field_index)
-                        .into_iter()
-                        .filter(|&field_index| !self.processed[field_index])
-                })
-                .collect::<BTreeSet<_>>();
-            (revealed_group, unrevealed_group)
-        });
+        let groups_sorted_by_complexity = revealed_groups
+            .iter()
+            .map(|revealed_group| {
+                let unrevealed_group = revealed_group
+                    .iter()
+                    .flat_map(|&field_index| {
+                        self.minefield
+                            .adjacent_fields(field_index)
+                            .into_iter()
+                            .filter(|&field_index| !self.processed[field_index])
+                    })
+                    .collect::<BTreeSet<_>>();
+                (revealed_group, unrevealed_group)
+            })
+            .sorted_unstable_by_key(|(_, unrevealed_group)| unrevealed_group.len());
 
-        for (revealed_group, unrevealed_group) in groups {
-            if let Some(max_complexity) = self.max_complexity {
-                let complexity = unrevealed_group.len();
-                if complexity > max_complexity {
-                    return if actions.is_empty() {
-                        Err(SolveError::TooComplex)
-                    } else {
-                        Ok(actions)
-                    };
-                }
+        for (revealed_group, unrevealed_group) in groups_sorted_by_complexity {
+            let required_complexity = Complexity::new(
+                unrevealed_group
+                    .len()
+                    .try_into()
+                    .unwrap_or(Complexity::MAX.0.get()),
+            )
+            .expect("complexity should be at least 2");
+            if Some(required_complexity) > max_complexity {
+                return Err(SolveError::TooComplex {
+                    required_complexity,
+                });
             }
-
-            actions.merge(self.complex_solve_actions(&revealed_group, &unrevealed_group));
+            let actions = self.complex_solve_actions(revealed_group, &unrevealed_group);
+            if !actions.is_empty() {
+                return Ok((actions, SolveStepInfo::Complex(required_complexity)));
+            }
         }
 
-        if actions.is_empty() {
-            Err(SolveError::Unsolvable)
+        Err(SolveError::Unsolvable)
+    }
+
+    /// Marks the given field as flagged.
+    pub fn flag(&mut self, field_index: usize) -> Result<(), FlagError> {
+        if self.processed[field_index] {
+            Err(FlagError::Duplicate)
+        } else if !self.minefield.is_mine(field_index) {
+            Err(FlagError::NotMine)
         } else {
-            Ok(actions)
+            assert!(self.unflagged_mines_left > 0);
+            self.unflagged_mines_left -= 1;
+            self.processed.set(field_index, true);
+            self.adjacent_unrevealed.remove(&field_index);
+            Ok(())
         }
     }
 
@@ -326,21 +400,6 @@ impl<'a, T: MinefieldReader> MinefieldSolver<'a, T> {
             })
     }
 
-    /// Marks the given field as flagged.
-    pub fn flag(&mut self, field_index: usize) -> Result<(), FlagError> {
-        if self.processed[field_index] {
-            Err(FlagError::Duplicate)
-        } else if !self.minefield.is_mine(field_index) {
-            Err(FlagError::NotMine)
-        } else {
-            assert!(self.unflagged_mines_left > 0);
-            self.unflagged_mines_left -= 1;
-            self.processed.set(field_index, true);
-            self.adjacent_unrevealed.remove(&field_index);
-            Ok(())
-        }
-    }
-
     /// Checks if the given set of mines would be valid when tested against `adjacent_revealed`.
     ///
     /// "Valid" means, the number of adjacent mines does not conflict with the placed mines.
@@ -419,8 +478,8 @@ pub enum FlagError {
 pub enum SolveError {
     #[error("not solvable")]
     Unsolvable,
-    #[error("too complex")]
-    TooComplex,
+    #[error("too complex to solve; would require {required_complexity:?}")]
+    TooComplex { required_complexity: Complexity },
 }
 
 /// Finds overlapping sets of fields and merges them into a single set.
