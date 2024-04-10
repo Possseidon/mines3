@@ -25,10 +25,10 @@ pub trait GenerateRandomly: Minefield + Sized {
             self.place_mine(field_index)
         }
 
-        let mut solver = MinefieldSolver::<Self>::new(&self);
+        let mut solver = MinefieldSolver::new(&self);
         solver.reveal(initial_field).ok()?;
 
-        solver.solvable().then_some(self)
+        solver.solve().is_ok().then_some(self)
     }
 }
 
@@ -61,11 +61,11 @@ pub trait GenerateIncrementally: Minefield + Sized {
                 let mine_field = open_fields.remove(thread_rng().gen_range(0..unused_fields));
                 self.place_mine(mine_field);
 
-                let mut solver = MinefieldSolver::<Self>::new(&self);
+                let mut solver = MinefieldSolver::new(&self);
                 solver
                     .reveal(initial_field)
                     .expect("initial field should be revealable");
-                if solver.solvable() {
+                if solver.solve().is_ok() {
                     break;
                 }
 

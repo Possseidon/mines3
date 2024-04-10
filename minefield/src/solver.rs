@@ -1,169 +1,117 @@
 use std::collections::BTreeSet;
 
+use bitvec::vec::BitVec;
 use itertools::Itertools;
-use maybe_owned::MaybeOwned;
 use thiserror::Error;
 
 use crate::minefield::MinefieldReader;
 
-#[derive(Error, Debug)]
-pub enum RevealError {
-    #[error("field already revealed")]
-    AlreadyRevealed,
-    #[error("mine revealed")]
-    Boom,
-}
+/// The default maximum complexity used by the [`MinefieldSolver`].
+pub(crate) const DEFAULT_MAX_COMPLEXITY: usize = 10;
 
-#[derive(Error, Debug)]
-pub enum FlagError {
-    #[error("field already flagged")]
-    AlreadyFlagged,
-    #[error("all mines flagged")]
-    AllMinesFlagged,
-}
-
-#[derive(Error, Debug)]
-pub enum SolveError {
-    #[error("not solvable")]
-    Unsolvable,
-    #[error("too complex")]
-    TooComplex,
-}
-
-#[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq, PartialOrd, Ord)]
-enum Field {
-    #[default]
-    Unrevealed,
-    Revealed {
-        adjacent_mines: usize,
-    },
-    Flagged,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
-pub struct SolveActions {
-    reveal: BTreeSet<usize>,
-    flag: BTreeSet<usize>,
-}
-
-impl SolveActions {
-    fn is_empty(&self) -> bool {
-        self.reveal.is_empty() && self.flag.is_empty()
-    }
-}
-
-impl std::ops::BitOr for SolveActions {
-    type Output = Self;
-
-    fn bitor(mut self, rhs: Self) -> Self::Output {
-        self |= rhs;
-        self
-    }
-}
-
-impl std::ops::BitOrAssign for SolveActions {
-    fn bitor_assign(&mut self, rhs: Self) {
-        self.reveal.extend(rhs.reveal);
-        self.flag.extend(rhs.flag);
-    }
-}
-
+/// Solves generic minesweeper games readable through the [`MinefieldReader`] trait.
+///
+/// This is not limited to classic grid-based fields.
 #[derive(Debug)]
 pub struct MinefieldSolver<'a, T: MinefieldReader> {
-    minefield: MaybeOwned<'a, T>,
+    /// The reader to get information about which fields are connected and which are mines.
+    minefield: &'a T,
+    /// The maximum complexity before solving returns [`SolveError::TooComplex`].
     max_complexity: Option<usize>,
-    fields: Vec<Field>,
+    /// Caches the number of adjacent mines for each field.
+    ///
+    /// Only set for fields that do not contain a mine themselves.
+    adjacent_mines: Vec<usize>,
+    /// Marks which fields are already revealed or flagged.
+    processed: BitVec,
+    /// A set of all unrevealed field indices that are adjacent to the revealed or flagged fields.
+    ///
+    /// This is used as an optimization, since usually you can only continue solving a minesweeper
+    /// board next to known fields.
     adjacent_unrevealed: BTreeSet<usize>,
+    /// The total number of mines that have not yet been flagged.
     unflagged_mines_left: usize,
+    /// The total number of fields that have not yet been revealed (excludes mines).
     reveals_left: usize,
 }
 
-pub(crate) const DEFAULT_MAX_COMPLEXITY: usize = 10;
-
 impl<'a, T: MinefieldReader> MinefieldSolver<'a, T> {
-    pub fn new(minefield: impl Into<MaybeOwned<'a, T>>) -> Self {
+    /// Creates a new [`MinefieldSolver`] for the given board with the [`DEFAULT_MAX_COMPLEXITY`].
+    pub fn new(minefield: &'a T) -> Self {
         Self::with_max_complexity(minefield, Some(DEFAULT_MAX_COMPLEXITY))
     }
 
-    pub fn with_max_complexity(
-        minefield: impl Into<MaybeOwned<'a, T>>,
-        max_complexity: Option<usize>,
-    ) -> Self {
-        let minefield = minefield.into();
+    /// Creates a new [`MinefieldSolver`] for the given board and maximum complexity.
+    pub fn with_max_complexity(minefield: &'a T, max_complexity: Option<usize>) -> Self {
         let field_count = minefield.field_count();
         let mines = minefield.mine_count();
+        let adjacent_mines = (0..field_count)
+            .map(|field_index| {
+                minefield
+                    .adjacent_fields(field_index)
+                    .into_iter()
+                    .filter(|&field_index| minefield.is_mine(field_index))
+                    .count()
+            })
+            .collect();
         Self {
             minefield,
             max_complexity,
-            fields: vec![Default::default(); field_count],
+            adjacent_mines,
+            processed: BitVec::repeat(false, field_count),
             adjacent_unrevealed: Default::default(),
             unflagged_mines_left: mines,
             reveals_left: field_count - mines,
         }
     }
 
-    pub fn fully_flagged_and_revealed(&self) -> bool {
-        self.unflagged_mines_left == 0 && self.reveals_left == 0
-    }
-
+    /// Reveals a single field.
+    ///
+    /// The main use-case for this is to reveal the initial field that was clicked by the user
+    /// before starting the solver.
     pub fn reveal(&mut self, field_index: usize) -> Result<(), RevealError> {
-        self.reveal_multiple([field_index].into())
+        self.reveal_many([field_index].into())
     }
 
-    pub fn reveal_multiple(&mut self, mut field_indices: BTreeSet<usize>) -> Result<(), RevealError> {
-        while let Some(&field_index) = field_indices.iter().next() {
+    /// Reveals all of the given fields, including adjacent fields that are know to not be mines.
+    pub fn reveal_many(&mut self, mut field_indices: BTreeSet<usize>) -> Result<(), RevealError> {
+        while let Some(field_index) = field_indices.pop_first() {
             if self.minefield.is_mine(field_index) {
-                return Err(RevealError::Boom);
-            } else if self.fields[field_index] != Field::Unrevealed {
-                return Err(RevealError::AlreadyRevealed);
-            } else {
-                field_indices.remove(&field_index);
-                self.reveals_left -= 1;
+                Err(RevealError::Mine)?;
+            }
+            if self.processed[field_index] {
+                Err(RevealError::Duplicate)?;
+            }
 
-                let adjacent_fields = self.minefield.adjacent_fields(field_index);
+            let adjacent_fields = self.minefield.adjacent_fields(field_index);
 
-                let adjacent_mines = adjacent_fields
+            let adjacent_mines = adjacent_fields
+                .iter()
+                .filter(|&&field_index| self.minefield.is_mine(field_index))
+                .count();
+
+            self.processed.set(field_index, true);
+            self.reveals_left -= 1;
+
+            self.adjacent_unrevealed.remove(&field_index);
+            self.adjacent_unrevealed.extend(
+                adjacent_fields
                     .iter()
-                    .filter(|&&field_index| self.minefield.is_mine(field_index))
-                    .count();
-                self.fields[field_index] = Field::Revealed { adjacent_mines };
+                    .filter(|&&field_index| !self.processed[field_index]),
+            );
 
-                self.adjacent_unrevealed.remove(&field_index);
-                self.adjacent_unrevealed.extend(
+            if adjacent_mines == 0 {
+                field_indices.extend(
                     adjacent_fields
-                        .iter()
-                        .filter(|&&field_index| self.fields[field_index] == Field::Unrevealed),
+                        .into_iter()
+                        .filter(|&field_index| !self.processed[field_index]),
                 );
-
-                if adjacent_mines == 0 {
-                    field_indices.extend(
-                        adjacent_fields
-                            .into_iter()
-                            .filter(|&field_index| self.fields[field_index] == Field::Unrevealed),
-                    );
-                }
             }
         }
         Ok(())
     }
 
-    pub fn flag(&mut self, field_index: usize) -> Result<(), FlagError> {
-        if self.unflagged_mines_left == 0 {
-            Err(FlagError::AllMinesFlagged)
-        } else if self.fields[field_index] == Field::Flagged {
-            Err(FlagError::AlreadyFlagged)
-        } else {
-            assert!(
-                self.minefield.is_mine(field_index),
-                "solver tried to flag a non-mine"
-            );
-            self.unflagged_mines_left -= 1;
-            self.fields[field_index] = Field::Flagged;
-            self.adjacent_unrevealed.remove(&field_index);
-            Ok(())
-        }
-    }
-
+    /// Attempts to solve the board, returning an error if solving is too complex or impossible.
     pub fn solve(&mut self) -> Result<(), SolveError> {
         while !self.fully_flagged_and_revealed() {
             self.solve_step()?;
@@ -171,24 +119,40 @@ impl<'a, T: MinefieldReader> MinefieldSolver<'a, T> {
         Ok(())
     }
 
-    pub fn solvable(mut self) -> bool {
-        self.solve().is_ok()
+    /// Returns `true` if all fields got either flagged or revealed.
+    pub fn fully_flagged_and_revealed(&self) -> bool {
+        self.unflagged_mines_left == 0 && self.reveals_left == 0
     }
 
+    /// Applies reveals/flags returned by [`Self::next_solve_actions`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if invalid fields are revealed. This should not happen as long as [`MinefieldReader`]
+    /// is implemented properly.
     pub fn solve_step(&mut self) -> Result<(), SolveError> {
         let solve_actions = self.next_solve_actions()?;
 
-        self.reveal_multiple(solve_actions.reveal)
-            .expect("solve tried to reveal an invalid field");
+        self.reveal_many(solve_actions.reveal).unwrap();
 
         for field_index in solve_actions.flag {
-            self.flag(field_index)
-                .expect("solve tried to flag an invalid field");
+            self.flag(field_index).unwrap();
         }
 
         Ok(())
     }
 
+    /// Uses a bunch of heuristics to find the next [`SolveActions`], i.e. reveals/flags to perform.
+    ///
+    /// The current implementation uses the following series of heuristics:
+    ///
+    /// 1. [`Self::flag_rest_if_no_reveals_left`]
+    /// 2. [`Self::reveal_rest_if_no_mines_left`]
+    /// 3. [`Self::trivial_solve_actions`]
+    /// 4. [`Self::complex_solve_actions`]
+    ///
+    /// Since the last step can quickly get out of hand in terms of complexity, it will only try to
+    /// solve groups of up to [`Self::max_complexity`] fields.
     pub fn next_solve_actions(&self) -> Result<SolveActions, SolveError> {
         if let Some(actions) = self.flag_rest_if_no_reveals_left() {
             return Ok(actions);
@@ -206,7 +170,8 @@ impl<'a, T: MinefieldReader> MinefieldSolver<'a, T> {
                     .adjacent_fields(field_index)
                     .into_iter()
                     .filter(|&field_index| {
-                        matches!(self.fields[field_index], Field::Revealed { .. })
+                        // TODO: do I need the is_mine check?
+                        self.processed[field_index] && !self.minefield.is_mine(field_index)
                     })
                     .collect::<BTreeSet<_>>()
             })
@@ -233,7 +198,7 @@ impl<'a, T: MinefieldReader> MinefieldSolver<'a, T> {
                     self.minefield
                         .adjacent_fields(field_index)
                         .into_iter()
-                        .filter(|&field_index| self.fields[field_index] == Field::Unrevealed)
+                        .filter(|&field_index| !self.processed[field_index])
                 })
                 .collect::<BTreeSet<_>>();
             (revealed_group, unrevealed_group)
@@ -251,7 +216,7 @@ impl<'a, T: MinefieldReader> MinefieldSolver<'a, T> {
                 }
             }
 
-            actions |= self.complex_solve_actions(&revealed_group, &unrevealed_group);
+            actions.merge(self.complex_solve_actions(&revealed_group, &unrevealed_group));
         }
 
         if actions.is_empty() {
@@ -261,84 +226,72 @@ impl<'a, T: MinefieldReader> MinefieldSolver<'a, T> {
         }
     }
 
+    /// Returns [`SolveActions`] to flag all remaining fields if there are only mines left.
     fn flag_rest_if_no_reveals_left(&self) -> Option<SolveActions> {
         (self.reveals_left == 0).then(|| SolveActions {
-            flag: self
-                .fields
-                .iter()
-                .enumerate()
-                .filter_map(|(field_index, &field)| {
-                    (field == Field::Unrevealed).then_some(field_index)
-                })
-                .collect(),
+            flag: self.processed.iter_zeros().collect(),
             ..Default::default()
         })
     }
 
+    /// Returns [`SolveActions`] to reveal all remaining fields if there are no more mines left.
     fn reveal_rest_if_no_mines_left(&self) -> Option<SolveActions> {
         (self.unflagged_mines_left == 0).then(|| SolveActions {
-            reveal: self
-                .fields
-                .iter()
-                .enumerate()
-                .filter_map(|(field_index, &field)| {
-                    (field == Field::Unrevealed).then_some(field_index)
-                })
-                .collect(),
+            reveal: self.processed.iter_zeros().collect(),
             ..Default::default()
         })
     }
 
+    /// Returns [`SolveActions`] for trivial fields.
+    ///
+    /// A field is considered "trivial" if its unrevealed adjacent fields are either all mines or
+    /// contains no more mines.
     fn trivial_solve_actions(&self, adjacent_revealed: &BTreeSet<usize>) -> SolveActions {
-        adjacent_revealed
-            .iter()
-            .fold(SolveActions::default(), |acc, &field_index| {
-                acc | match self.fields[field_index] {
-                    Field::Revealed { adjacent_mines } => {
-                        let (flags, unrevealed) = self
-                            .minefield
-                            .adjacent_fields(field_index)
-                            .into_iter()
-                            .fold((0, 0), |(flags, unrevealed), field_index| {
-                                match self.fields[field_index] {
-                                    Field::Flagged => (flags + 1, unrevealed),
-                                    Field::Unrevealed { .. } => (flags, unrevealed + 1),
-                                    Field::Revealed { .. } => (flags, unrevealed),
-                                }
-                            });
-                        if flags == adjacent_mines {
-                            SolveActions {
-                                reveal: self
-                                    .minefield
-                                    .adjacent_fields(field_index)
-                                    .into_iter()
-                                    .filter(|&field_index| {
-                                        self.fields[field_index] == Field::Unrevealed
-                                    })
-                                    .collect(),
-                                ..Default::default()
-                            }
-                        } else if flags + unrevealed == adjacent_mines {
-                            SolveActions {
-                                flag: self
-                                    .minefield
-                                    .adjacent_fields(field_index)
-                                    .into_iter()
-                                    .filter(|&field_index| {
-                                        self.fields[field_index] == Field::Unrevealed
-                                    })
-                                    .collect(),
-                                ..Default::default()
-                            }
-                        } else {
-                            Default::default()
-                        }
+        let mut solve_actions = SolveActions::default();
+        for &field_index in adjacent_revealed {
+            let (flags, unrevealed) = self
+                .minefield
+                .adjacent_fields(field_index)
+                .into_iter()
+                .fold((0, 0), |(flags, unrevealed), field_index| {
+                    if !self.processed[field_index] {
+                        (flags, unrevealed + 1)
+                    } else if self.minefield.is_mine(field_index) {
+                        (flags + 1, unrevealed)
+                    } else {
+                        (flags, unrevealed)
                     }
-                    Field::Unrevealed | Field::Flagged => panic!("field should be revealed"),
-                }
-            })
+                });
+
+            let adjacent_mines = self.adjacent_mines[field_index];
+            if flags == adjacent_mines {
+                solve_actions.merge(SolveActions {
+                    reveal: self
+                        .minefield
+                        .adjacent_fields(field_index)
+                        .into_iter()
+                        .filter(|&field_index| !self.processed[field_index])
+                        .collect(),
+                    ..Default::default()
+                });
+            } else if flags + unrevealed == adjacent_mines {
+                solve_actions.merge(SolveActions {
+                    flag: self
+                        .minefield
+                        .adjacent_fields(field_index)
+                        .into_iter()
+                        .filter(|&field_index| !self.processed[field_index])
+                        .collect(),
+                    ..Default::default()
+                });
+            }
+        }
+        solve_actions
     }
 
+    /// Returns _all_ [`SolveActions`].
+    ///
+    /// This is implemented by trying all valid mine placements.
     fn complex_solve_actions(
         &self,
         adjacent_revealed: &BTreeSet<usize>,
@@ -373,6 +326,24 @@ impl<'a, T: MinefieldReader> MinefieldSolver<'a, T> {
             })
     }
 
+    /// Marks the given field as flagged.
+    pub fn flag(&mut self, field_index: usize) -> Result<(), FlagError> {
+        if self.processed[field_index] {
+            Err(FlagError::Duplicate)
+        } else if !self.minefield.is_mine(field_index) {
+            Err(FlagError::NotMine)
+        } else {
+            assert!(self.unflagged_mines_left > 0);
+            self.unflagged_mines_left -= 1;
+            self.processed.set(field_index, true);
+            self.adjacent_unrevealed.remove(&field_index);
+            Ok(())
+        }
+    }
+
+    /// Checks if the given set of mines would be valid when tested against `adjacent_revealed`.
+    ///
+    /// "Valid" means, the number of adjacent mines does not conflict with the placed mines.
     fn is_mine_placement_valid(
         &self,
         mines: &BTreeSet<usize>,
@@ -383,12 +354,7 @@ impl<'a, T: MinefieldReader> MinefieldSolver<'a, T> {
         }
 
         adjacent_revealed.iter().all(|&field_index| {
-            let expected_mines = match self.fields[field_index] {
-                Field::Revealed { adjacent_mines } => adjacent_mines,
-                Field::Unrevealed | Field::Flagged => {
-                    panic!("field should be revealed");
-                }
-            };
+            let expected_mines = self.adjacent_mines[field_index];
 
             let (actual_mines, unrevealed) = self
                 .minefield
@@ -399,20 +365,65 @@ impl<'a, T: MinefieldReader> MinefieldSolver<'a, T> {
                         (actual_mines + 1, unrevealed)
                     } else if self.adjacent_unrevealed.contains(&field_index) {
                         (actual_mines, unrevealed)
+                    } else if !self.processed[field_index] {
+                        (actual_mines, unrevealed + 1)
+                    } else if self.minefield.is_mine(field_index) {
+                        (actual_mines + 1, unrevealed)
                     } else {
-                        match self.fields[field_index] {
-                            Field::Unrevealed => (actual_mines, unrevealed + 1),
-                            Field::Revealed { .. } => (actual_mines, unrevealed),
-                            Field::Flagged => (actual_mines + 1, unrevealed),
-                        }
+                        (actual_mines, unrevealed)
                     }
                 });
 
-            (actual_mines..=(actual_mines + unrevealed)).contains(&expected_mines)
+            (actual_mines..=actual_mines + unrevealed).contains(&expected_mines)
         })
     }
 }
 
+/// A set of fields to reveal or flag.
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SolveActions {
+    reveal: BTreeSet<usize>,
+    flag: BTreeSet<usize>,
+}
+
+impl SolveActions {
+    /// Whether this set contains neither reveals nor flags.
+    fn is_empty(&self) -> bool {
+        self.reveal.is_empty() && self.flag.is_empty()
+    }
+
+    /// Extends this set by another one.
+    fn merge(&mut self, other: Self) {
+        self.reveal.extend(other.reveal);
+        self.flag.extend(other.flag);
+    }
+}
+
+#[derive(Error, Debug)]
+pub enum RevealError {
+    #[error("field already revealed or flagged")]
+    Duplicate,
+    #[error("mine revealed")]
+    Mine,
+}
+
+#[derive(Error, Debug)]
+pub enum FlagError {
+    #[error("field already revealed or flagged")]
+    Duplicate,
+    #[error("the flagged field is not a mine")]
+    NotMine,
+}
+
+#[derive(Error, Debug)]
+pub enum SolveError {
+    #[error("not solvable")]
+    Unsolvable,
+    #[error("too complex")]
+    TooComplex,
+}
+
+/// Finds overlapping sets of fields and merges them into a single set.
 fn group_overlapping(mut small_revealed_groups: Vec<BTreeSet<usize>>) -> Vec<BTreeSet<usize>> {
     let mut revealed_groups = Vec::new();
     while let Some(mut revealed_group) = small_revealed_groups.pop() {
@@ -447,26 +458,25 @@ fn color_code(mines: usize) -> &'static str {
 
 impl<T: MinefieldReader> std::fmt::Display for MinefieldSolver<'_, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for (field_index, &field) in self.fields.iter().enumerate() {
-            match field {
-                Field::Unrevealed => {
-                    if self.adjacent_unrevealed.contains(&field_index) {
-                        write!(f, "\x1B[33m?\x1B[0m ")
-                    } else {
-                        write!(f, "  ")
-                    }
+        for (field_index, processed) in self.processed.iter().enumerate() {
+            if !*processed {
+                if self.adjacent_unrevealed.contains(&field_index) {
+                    write!(f, "\x1B[33m?\x1B[0m ")?;
+                } else {
+                    write!(f, "  ")?;
                 }
-                Field::Revealed { adjacent_mines } => {
-                    if adjacent_mines == 0 {
-                        write!(f, "  ")
-                    } else {
-                        write!(f, "{}{adjacent_mines}\x1B[0m ", color_code(adjacent_mines),)
-                    }
+            } else if self.minefield.is_mine(field_index) {
+                write!(f, "🚩")?;
+            } else {
+                let adjacent_mines = self.adjacent_mines[field_index];
+                if adjacent_mines == 0 {
+                    write!(f, "  ")?;
+                } else {
+                    write!(f, "{}{adjacent_mines}\x1B[0m ", color_code(adjacent_mines))?;
                 }
-                Field::Flagged => write!(f, "🚩"),
-            }?;
+            }
 
-            if (field_index + 1) % 9 == 0 {
+            if (field_index + 1) % 30 == 0 {
                 writeln!(f)?;
             }
         }

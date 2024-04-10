@@ -1,9 +1,5 @@
 use std::collections::BTreeSet;
 
-// TODO: Make field index type generic.
-// -> u8 going up to 255 is already plenty and would great for performance.
-//    (both memory and speed)
-
 pub trait AdjacentFields {
     fn field_count(&self) -> usize;
     fn adjacent_fields(&self, field_index: usize) -> BTreeSet<usize>;
