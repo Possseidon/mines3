@@ -4,5 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-bevy = "0.10.0"
+bevy = "0.13.2"
+nalgebra = { version = "0.32.5", features = ["glam023"] }
 minefield = { path = "../minefield" }

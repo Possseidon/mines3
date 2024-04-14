@@ -6,6 +6,6 @@ edition = "2021"
 [dependencies]
 bitvec = "1.0.1"
 itertools = "0.12.1"
-maybe-owned = "0.3.4"
 rand = "0.8.5"
+rand_pcg = "0.3.1"
 thiserror = "1.0.58"

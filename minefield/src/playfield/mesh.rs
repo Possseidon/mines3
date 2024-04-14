@@ -3,8 +3,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use bitvec::vec::BitVec;
 use itertools::iproduct;
 
-use crate::minefield::{AdjacentFields, MinefieldReader, MinefieldWriter};
-
 struct Vertex {
     x: f32,
     y: f32,
@@ -111,12 +109,12 @@ impl Minefield3D {
     }
 }
 
-impl AdjacentFields for Minefield3D {
+impl PlayfieldGraph for Minefield3D {
     fn field_count(&self) -> usize {
         self.mines.len()
     }
 
-    fn adjacent_fields(&self, field_index: usize) -> BTreeSet<usize> {
+    fn counted_fields(&self, field_index: usize) -> BTreeSet<usize> {
         self.adjacency_lookup[field_index].clone()
     }
 }
