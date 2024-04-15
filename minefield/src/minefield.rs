@@ -1,6 +1,6 @@
 use crate::{
     mine_map::MineMap,
-    player::{Field, Player},
+    player::{Field, PartialField, Player},
     playfield::Playfield,
 };
 
@@ -17,26 +17,14 @@ impl<T: Playfield> Minefield<T> {
     fn count_mines(&self, field_index: usize) -> usize {
         self.playfield
             .counted_fields(field_index)
-            .map(|field_index| self.mines.is_mine(field_index) as usize)
-            .sum()
-    }
-
-    fn field_with_count(&self, field_index: usize, mine: bool) -> Field {
-        let count_mines = || self.count_mines(field_index);
-        if mine {
-            Field::Mine {
-                count: self.rules.reveal_mines.then(count_mines),
-            }
-        } else {
-            Field::Free {
-                count: count_mines(),
-            }
-        }
+            .filter(|&field_index| self.mines.is_mine(field_index))
+            .count()
     }
 
     fn simulate_click(&self, field_index: usize, flag: bool) -> Field {
         assert_eq!(self.mines.is_mine(field_index), flag);
-        self.field_with_count(field_index, flag)
+        self.get(field_index)
+            .with_count(|| self.count_mines(field_index))
     }
 }
 
@@ -59,8 +47,14 @@ impl<T: Playfield> Player for Minefield<T> {
         self.simulate_click(field_index, flag)
     }
 
-    fn get(&self, field_index: usize) -> Field {
-        self.field_with_count(field_index, self.mines.is_mine(field_index))
+    fn get(&self, field_index: usize) -> PartialField {
+        if self.mines.is_mine(field_index) {
+            PartialField::Flag {
+                has_count: self.rules.reveal_mines,
+            }
+        } else {
+            PartialField::Free
+        }
     }
 }
 
@@ -81,7 +75,7 @@ impl<T: Playfield> Player for &Minefield<T> {
         self.simulate_click(field_index, flag)
     }
 
-    fn get(&self, field_index: usize) -> Field {
+    fn get(&self, field_index: usize) -> PartialField {
         (*self).get(field_index)
     }
 }

@@ -48,13 +48,13 @@ pub trait Player {
     /// # Panics
     ///
     /// May panic if a field has not been [`Player::click`]ed yet.
-    fn get(&self, field_index: usize) -> Field;
+    fn get(&self, field_index: usize) -> PartialField;
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum Field {
     Free { count: usize },
-    Mine { count: Option<usize> },
+    Flag { count: Option<usize> },
 }
 
 impl Field {
@@ -62,14 +62,46 @@ impl Field {
         matches!(self, Self::Free { .. })
     }
 
-    pub fn is_mine(self) -> bool {
-        matches!(self, Self::Mine { .. })
+    pub fn is_flag(self) -> bool {
+        matches!(self, Self::Flag { .. })
     }
 
     pub fn count(self) -> Option<usize> {
         match self {
-            Field::Free { count } => Some(count),
-            Field::Mine { count } => count,
+            Self::Free { count } => Some(count),
+            Self::Flag { count } => count,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum PartialField {
+    Free,
+    Flag { has_count: bool },
+}
+
+impl PartialField {
+    pub fn with_count(self, count: impl FnOnce() -> usize) -> Field {
+        match self {
+            PartialField::Free => Field::Free { count: count() },
+            PartialField::Flag { has_count } => Field::Flag {
+                count: has_count.then(count),
+            },
+        }
+    }
+
+    pub fn is_free(self) -> bool {
+        matches!(self, Self::Free)
+    }
+
+    pub fn is_flag(self) -> bool {
+        matches!(self, Self::Flag { .. })
+    }
+
+    pub fn has_count(self) -> bool {
+        match self {
+            Self::Free => true,
+            Self::Flag { has_count } => has_count,
         }
     }
 }
