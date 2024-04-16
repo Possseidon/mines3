@@ -8,6 +8,12 @@ pub struct MineMap {
     mines: BitBox,
 }
 
+impl AsRef<Self> for MineMap {
+    fn as_ref(&self) -> &Self {
+        self
+    }
+}
+
 impl MineMap {
     /// Creates a new [`MineMap`] without any mines.
     pub fn new(field_count: NonZeroUsize) -> Self {

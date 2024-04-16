@@ -45,7 +45,7 @@ impl GridSize {
     fn right(self, x: usize, wrap: bool) -> Option<usize> {
         assert!(x < self.width.get());
         (x < self.width.get() - 1)
-            .then(|| x - 1)
+            .then(|| x + 1)
             .or_else(|| wrap.then_some(0))
     }
 
@@ -160,27 +160,24 @@ impl Grid {
         let right = count.right.then(|| size.right(x, wrap_x)).flatten();
 
         let wrap_y = self.wrap.y;
-        let above = count.above.then(|| size.above(x, wrap_y)).flatten();
-        let below = count.below.then(|| size.below(x, wrap_y)).flatten();
+        let above = count.above.then(|| size.above(y, wrap_y)).flatten();
+        let below = count.below.then(|| size.below(y, wrap_y)).flatten();
 
+        let if_diagonal = |pos| if count.diagonals { pos } else { None };
+
+        // TODO: This is not sorted when it wraps
         [
-            Some([
-                left.map(|x| (x, y)),
-                right.map(|x| (x, y)),
-                above.map(|y| (x, y)),
-                below.map(|y| (x, y)),
-            ]),
-            count.diagonals.then_some([
-                left.zip(above),
-                left.zip(below),
-                right.zip(above),
-                right.zip(below),
-            ]),
+            if_diagonal(left.zip(above)),
+            above.map(|y| (x, y)),
+            if_diagonal(right.zip(above)),
+            left.map(|x| (x, y)),
+            right.map(|x| (x, y)),
+            if_diagonal(left.zip(below)),
+            below.map(|y| (x, y)),
+            if_diagonal(right.zip(below)),
         ]
         .into_iter()
-        .flatten() // remove diagonals if they aren't counted
-        .flatten() // flatten inner 4-element arrays
-        .flatten() // remove out of bounds fields
+        .flatten()
         .map(|(x, y)| GridPos { x, y })
         .map(move |grid_pos| {
             grid_pos

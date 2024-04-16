@@ -7,28 +7,28 @@ use crate::{
 /// Combines a generic [`Playfield`] with a [`MineMap`] and adds some [`MinefieldRules`] on top.
 ///
 /// Implements the [`Player`] trait.
-pub struct Minefield<T: Playfield> {
+pub struct Minefield<T: Playfield, M: AsRef<MineMap>> {
     pub playfield: T,
-    pub mines: MineMap,
+    pub mines: M,
     pub rules: MinefieldRules,
 }
 
-impl<T: Playfield> Minefield<T> {
+impl<T: Playfield, M: AsRef<MineMap>> Minefield<T, M> {
     fn count_mines(&self, field_index: usize) -> usize {
         self.playfield
             .counted_fields(field_index)
-            .filter(|&field_index| self.mines.is_mine(field_index))
+            .filter(|&field_index| self.mines.as_ref().is_mine(field_index))
             .count()
     }
 
     fn simulate_click(&self, field_index: usize, flag: bool) -> Field {
-        assert_eq!(self.mines.is_mine(field_index), flag);
+        assert_eq!(self.mines.as_ref().is_mine(field_index), flag);
         self.get(field_index)
             .with_count(|| self.count_mines(field_index))
     }
 }
 
-impl<T: Playfield> Player for Minefield<T> {
+impl<T: Playfield, M: AsRef<MineMap>> Player for Minefield<T, M> {
     const IS_ORACLE: bool = true;
 
     type Playfield = T;
@@ -40,7 +40,7 @@ impl<T: Playfield> Player for Minefield<T> {
     fn mine_count(&self) -> Option<usize> {
         self.rules
             .mine_count_available
-            .then(|| self.mines.mine_count())
+            .then(|| self.mines.as_ref().mine_count())
     }
 
     fn click(&mut self, field_index: usize, flag: bool) -> Field {
@@ -48,7 +48,7 @@ impl<T: Playfield> Player for Minefield<T> {
     }
 
     fn get(&self, field_index: usize) -> PartialField {
-        if self.mines.is_mine(field_index) {
+        if self.mines.as_ref().is_mine(field_index) {
             PartialField::Flag {
                 has_count: self.rules.reveal_mines,
             }
@@ -58,7 +58,7 @@ impl<T: Playfield> Player for Minefield<T> {
     }
 }
 
-impl<T: Playfield> Player for &Minefield<T> {
+impl<T: Playfield, M: AsRef<MineMap>> Player for &Minefield<T, M> {
     const IS_ORACLE: bool = true;
 
     type Playfield = T;

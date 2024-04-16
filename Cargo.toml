@@ -1,8 +1,5 @@
 [workspace]
-members = [
-    "minefield",
-    # "mines3",
-]
+members = ["minefield", "mines3"]
 resolver = "2"
 
 [profile.dev]

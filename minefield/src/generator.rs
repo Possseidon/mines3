@@ -1,29 +1,41 @@
-use std::num::NonZeroU128;
+use std::num::{NonZeroU128, NonZeroU64};
 
-use rand::{seq::IteratorRandom, thread_rng, Rng, SeedableRng};
+use rand::{
+    distributions::{Distribution, Standard},
+    seq::IteratorRandom,
+    Rng, SeedableRng,
+};
 use rand_pcg::Pcg64Mcg;
 use thiserror::Error;
 
 use crate::{
+    game_state::{Complexity, Difficulty, GameState, SolveError},
+    mine_map::MineMap,
+    minefield::{Minefield, MinefieldRules},
     playfield::Playfield,
-    solver::{Complexity, Difficulty, MinefieldSolver, RevealError, SolveError},
 };
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub struct DifficultyRange {
-    min: Difficulty,
-    max: Difficulty,
+    pub min: Difficulty,
+    pub max: Difficulty,
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-pub struct Seed(NonZeroU128);
+pub struct Seed(pub NonZeroU64);
+
+impl Distribution<Seed> for Standard {
+    fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> Seed {
+        Seed(self.sample(rng))
+    }
+}
 
 pub trait MinefieldGenerator {
     type Error;
 
-    fn generate<T: Playfield>(
+    fn generate(
         &self,
-        playfield: &T,
+        playfield: &impl Playfield,
         initial_field: usize,
         difficulty: DifficultyRange,
         seed: Seed,
@@ -32,71 +44,84 @@ pub trait MinefieldGenerator {
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub struct RandomMinefield {
-    mine_count: usize,
+    pub mine_count: usize,
 }
 
 impl MinefieldGenerator for RandomMinefield {
     type Error = RandomMinefieldGenerationError;
 
-    fn generate<T: Playfield>(
+    fn generate(
         &self,
-        minefield: &mut T,
+        playfield: &impl Playfield,
         initial_field: usize,
-        difficulty: DifficultyRange,
+        difficulty_range: DifficultyRange,
         seed: Seed,
-    ) -> Result<Difficulty, Self::Error> {
-        let rng = Pcg64Mcg::from_seed(seed.0.get().to_le_bytes());
-        Pcg64Mcg::from_entropy();
+    ) -> Result<(Difficulty, MineMap), Self::Error> {
+        let mut rng = Pcg64Mcg::seed_from_u64(seed.0.get());
 
-        let values = (0..minefield.len().get())
-            .choose_multiple(&mut thread_rng(), self.mine_count)
+        let field_count = playfield.field_count().unwrap();
+        let mut mines = MineMap::new(field_count);
+
+        let mine_indices = (0..field_count.get())
+            .choose_multiple(&mut rng, self.mine_count)
             .into_iter();
 
-        for field_index in values {
-            minefield.place_mine(field_index)
+        for field_index in mine_indices {
+            mines.place_mine(field_index);
         }
 
-        let mut solver = MinefieldSolver::new(minefield);
+        if mines.is_mine(initial_field) {
+            return Err(RandomMinefieldGenerationError::Unsolvable);
+        }
 
-        solver.reveal(initial_field).map_err(|error| match error {
-            RevealError::Duplicate => unreachable!(),
-            RevealError::Mine => RandomMinefieldGenerationError::Unsolvable,
-        })?;
+        let player = Minefield {
+            playfield,
+            mines: &mines,
+            rules: MinefieldRules {
+                reveal_mines: false,
+                mine_count_available: true,
+            },
+        };
+        let mut game_state = GameState::new(player);
 
-        let difficulty = solver
-            .solve(self.max_difficulty)
+        game_state.click(initial_field, false);
+        let difficulty = game_state
+            .solve(difficulty_range.max)
             .map_err(|error| match error {
+                SolveError::TooDifficult { complexity } => {
+                    RandomMinefieldGenerationError::TooHard { complexity }
+                }
+                SolveError::TooComplex => RandomMinefieldGenerationError::TooComplex,
                 SolveError::Unsolvable => RandomMinefieldGenerationError::Unsolvable,
-                SolveError::TooComplex {
-                    complexity: required_complexity,
-                } => RandomMinefieldGenerationError::TooHard(required_complexity),
             })?;
 
-        if difficulty >= self.min_difficulty {
-            Ok(difficulty)
+        if difficulty >= difficulty_range.min {
+            Ok((difficulty, mines))
         } else {
-            Err(RandomMinefieldGenerationError::TooEasy(difficulty))
+            Err(RandomMinefieldGenerationError::TooEasy { difficulty })
         }
     }
 }
 
 #[derive(Debug, Error)]
 pub enum RandomMinefieldGenerationError {
-    #[error("randomly generated minefield is {0:?} which is too easy")]
-    TooEasy(Difficulty),
-    #[error("randomly generated minefield requires {0:?} or more which is too hard")]
-    TooHard(Complexity),
+    #[error("randomly generated minefield is {difficulty:?} which is too easy")]
+    TooEasy { difficulty: Difficulty },
+    #[error("randomly generated minefield requires {complexity:?} or more which is too hard")]
+    TooHard { complexity: Complexity },
+    #[error("randomly generated minefield is too complex for the solver")]
+    TooComplex,
     #[error("randomly generated minefield is unsolvable")]
     Unsolvable,
 }
 
-pub struct IncrementalMinefield {
-    mine_count: usize,
-    initial_field: usize,
-    min_difficulty: Difficulty,
-    max_difficulty: Difficulty,
-    seed: u64,
-}
+// pub struct IncrementalMinefield {
+//     mine_count: usize,
+//     initial_field: usize,
+//     min_difficulty: Difficulty,
+//     max_difficulty: Difficulty,
+//     seed: u64,
+// }
 
 // impl MinefieldGenerator for GenerateIncrementally {
 //     fn generate<T: Minefield>(&self, minefield: T) -> Result<T, T> {
